@@ -1,4 +1,3 @@
-```markdown
 # 🚀 Xray-XHTTP-Panel 纯 IP 极简安全版
 
 这是一个专为“纯 IP 直连”设计的极简、高效、高安全的 Xray 节点一键部署脚本。
@@ -28,7 +27,8 @@
 SSH 登录到您的服务器，切换至 root 权限，然后执行以下命令即可一键部署：
 
 ```bash
-wget -O install.sh [https://raw.githubusercontent.com/kejee/xray-xhttp-panel/main/install.sh](https://raw.githubusercontent.com/kejee/xray-xhttp-panel/main/install.sh)
+wget -O install.sh https://raw.githubusercontent.com/kejee/xray-xhttp-panel/main/install.sh
+
 sudo bash install.sh
 
 ```
