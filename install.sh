@@ -25,10 +25,24 @@ REALITY_DEST="${REALITY_DOMAIN}:443"
 XHTTP_DOMAIN="www.yahoo.com"
 XHTTP_PATH="/weather"
 
+# ========== 安全随机十六进制生成函数 (兼容无 xxd 的精简环境) ==========
+generate_hex() {
+    local bytes=$1
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex "$bytes"
+    elif command -v xxd >/dev/null 2>&1; then
+        head -c "$bytes" /dev/urandom | xxd -p -c "$bytes" | tr -d " \n"
+    elif command -v od >/dev/null 2>&1; then
+        od -vN "$bytes" -An -tx1 /dev/urandom | tr -d " \n"
+    else
+        tr -dc 'a-f0-9' < /dev/urandom | head -c "$((bytes * 2))"
+    fi
+}
+
 # ========== 账户与安全密钥动态生成 ==========
 USER_NAME="admin"
-USER_PASSWORD=$(head -c 16 /dev/urandom | xxd -ps | head -c 12)
-FLASK_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
+USER_PASSWORD=$(generate_hex 6)
+FLASK_SECRET=$(generate_hex 16)
 
 echo "=========================================="
 echo " 🌟 欢迎使用 Xray-XHTTP-Panel 一键安装脚本"
@@ -80,7 +94,7 @@ fi
 
 # ========== 安装依赖并创建 venv ==========
 echo "[1/7] 安装依赖与创建虚拟环境..."
-apt update && apt install -y curl wget unzip qrencode python3 python3-venv sqlite3 jq
+apt update && apt install -y curl wget unzip qrencode python3 python3-venv sqlite3 jq xxd openssl
 
 mkdir -p "$XRAY_PATH"
 python3 -m venv "$XRAY_PATH/venv"
@@ -121,7 +135,7 @@ if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
     KEY_JSON=$($XRAY_BIN x25519)
     PRIVATE_KEY=$(echo "$KEY_JSON" | grep -i "Private" | awk -F': ' '{print $2}' | tr -d ' ')
     PUBLIC_KEY=$(echo "$KEY_JSON" | grep -i "Public" | awk -F': ' '{print $2}' | tr -d ' ')
-    SHORT_ID=$(head -c 8 /dev/urandom | xxd -ps)
+    SHORT_ID=$(generate_hex 8)
     
     echo "PRIVATE_KEY=\"$PRIVATE_KEY\"" > "$KEY_FILE"
     echo "PUBLIC_KEY=\"$PUBLIC_KEY\"" >> "$KEY_FILE"
