@@ -34,13 +34,20 @@
 
 ## 🚀 快速安装
 
-SSH 登录到您的服务器，切换至 root 权限，然后执行以下命令即可一键部署：
+SSH 登录到您的服务器，切换至 root 权限，可根据您的习惯选择以下任一方式进行部署：
 
+### 方式一：Git 完整仓库克隆 (推荐)
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/kejee/xray-xhttp-panel/main/install.sh
-
+git clone https://github.com/kejee/xray-xhttp-panel.git
+cd xray-xhttp-panel
 sudo bash install.sh
 ```
+
+### 方式二：单行极简一键运行 (自包含脚本)
+```bash
+wget -O install.sh https://raw.githubusercontent.com/kejee/xray-xhttp-panel/main/install.sh && sudo bash install.sh
+```
+> *注：`install.sh` 脚本已内置离线自包含机制，单文件直接运行亦能全自动部署所有后台服务与监控组件，无需担心网络依赖缺失。*
 
 > **💡 注意：** 安装成功后，终端会打印出包含面板登录地址、动态随机密码以及初始端口信息的汇总表格，请务必截图或保存！
 
