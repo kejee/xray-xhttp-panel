@@ -1060,18 +1060,26 @@ cat > "$XRAY_PATH/web/templates/dashboard.html" <<'EOF'
               const elSess = document.getElementById('session-' + uid);
               const elBadge = document.getElementById('badge-' + uid);
 
-              if (elD) elD.innerText = u.total_down_formatted;
-              if (elU) elU.innerText = u.total_up_formatted;
-              if (elS) elS.innerText = `↓ ${u.speed_down_formatted} | ↑ ${u.speed_up_formatted}`;
-              if (elSess) elSess.innerText = `${u.session_duration_formatted} (${u.session_traffic_formatted})`;
+              const down = u.total_down_formatted || u.total_downlink || '0 B';
+              const up = u.total_up_formatted || u.total_uplink || '0 B';
+              const spdDown = u.speed_down_formatted || u.speed_down || '0 B/s';
+              const spdUp = u.speed_up_formatted || u.speed_up || '0 B/s';
+              const sessDur = u.session_duration_formatted || u.online_duration || '0秒';
+              const sessTraf = u.session_traffic_formatted || u.session_traffic || '0 B';
+              const lastAct = u.last_active_human || u.last_seen_text || '离线';
+
+              if (elD) elD.innerText = down;
+              if (elU) elU.innerText = up;
+              if (elS) elS.innerText = `↓ ${spdDown} | ↑ ${spdUp}`;
+              if (elSess) elSess.innerText = `${sessDur} (${sessTraf})`;
 
               if (elBadge) {
                 if (u.is_online) {
                   elBadge.className = 'text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 font-medium animate-pulse';
                   elBadge.innerText = '在线传输中';
-                } else if (u.last_active_human && u.last_active_human !== '刚刚活跃') {
+                } else if (lastAct && lastAct !== '刚刚' && lastAct !== '从未活跃') {
                   elBadge.className = 'text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500';
-                  elBadge.innerText = u.last_active_human;
+                  elBadge.innerText = lastAct;
                 } else {
                   elBadge.className = 'text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500';
                   elBadge.innerText = '离线';

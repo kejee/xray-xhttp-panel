@@ -43,8 +43,6 @@ class StatsPlugin:
         self.total_speed_up = 0
         self.total_speed_down = 0
 
-        self._init_db()
-
         # 月度共享流量池指标 (默认 0 表示无限制)
         self.pool_stats = {
             "used_bytes": 0,
@@ -57,6 +55,7 @@ class StatsPlugin:
             "status": "normal"  # normal / warning / danger
         }
 
+        self._init_db()
         self._start_collector()
 
     def _init_db(self):
@@ -100,7 +99,42 @@ class StatsPlugin:
                     conn.execute(f'ALTER TABLE user_traffic ADD COLUMN {col} {col_type}')
                 except Exception:
                     pass
-            conn.commit()
+            # 预热历史用量到 runtime_stats 和 pool_stats，避免初次加载时为未定义或空白
+            cur = conn.cursor()
+            cur.execute('SELECT uid, email, total_uplink, total_downlink, monthly_uplink, monthly_downlink, last_seen FROM user_traffic')
+            total_p_up = 0
+            total_p_down = 0
+            for r in cur.fetchall():
+                uid, email, up, down, m_up, m_down, last_seen = r
+                total_p_up += (m_up or 0)
+                total_p_down += (m_down or 0)
+                up_s = self._format_bytes(up or 0)
+                down_s = self._format_bytes(down or 0)
+                last_s = self._format_last_seen(last_seen)
+                self.runtime_stats[uid] = {
+                    "uid": uid,
+                    "email": email,
+                    "is_online": False,
+                    "speed_up": "0 B/s",
+                    "speed_up_formatted": "0 B/s",
+                    "speed_down": "0 B/s",
+                    "speed_down_formatted": "0 B/s",
+                    "total_uplink": up_s,
+                    "total_up_formatted": up_s,
+                    "total_downlink": down_s,
+                    "total_down_formatted": down_s,
+                    "total_traffic": self._format_bytes((up or 0) + (down or 0)),
+                    "monthly_traffic": self._format_bytes((m_up or 0) + (m_down or 0)),
+                    "session_traffic": "0 B",
+                    "session_traffic_formatted": "0 B",
+                    "online_duration": "0秒",
+                    "session_duration_formatted": "0秒",
+                    "last_seen_text": last_s,
+                    "last_active_human": last_s
+                }
+            pool_used = total_p_up + total_p_down
+            self.pool_stats["used_bytes"] = pool_used
+            self.pool_stats["used_formatted"] = self._format_bytes(pool_used)
             conn.commit()
 
     def _format_bytes(self, size_bytes):
@@ -293,19 +327,34 @@ class StatsPlugin:
                 total_spd_up += speed_up
                 total_spd_down += speed_down
 
+                spd_up_str = f"{self._format_bytes(speed_up)}/s"
+                spd_down_str = f"{self._format_bytes(speed_down)}/s"
+                up_str = self._format_bytes(db_up)
+                down_str = self._format_bytes(db_down)
+                sess_traffic_str = self._format_bytes(sess['session_bytes'])
+                dur_str = self._format_duration(duration_sec) if is_active else "0秒"
+                last_seen_str = self._format_last_seen(last_seen)
+
                 new_runtime[uid] = {
                     "uid": uid,
                     "email": email,
                     "is_online": is_active,
-                    "speed_up": f"{self._format_bytes(speed_up)}/s",
-                    "speed_down": f"{self._format_bytes(speed_down)}/s",
-                    "total_uplink": self._format_bytes(db_up),
-                    "total_downlink": self._format_bytes(db_down),
+                    "speed_up": spd_up_str,
+                    "speed_up_formatted": spd_up_str,
+                    "speed_down": spd_down_str,
+                    "speed_down_formatted": spd_down_str,
+                    "total_uplink": up_str,
+                    "total_up_formatted": up_str,
+                    "total_downlink": down_str,
+                    "total_down_formatted": down_str,
                     "total_traffic": self._format_bytes(db_up + db_down),
                     "monthly_traffic": self._format_bytes(m_up + m_down),
-                    "session_traffic": self._format_bytes(sess['session_bytes']),
-                    "online_duration": self._format_duration(duration_sec) if is_active else "--",
-                    "last_seen_text": self._format_last_seen(last_seen)
+                    "session_traffic": sess_traffic_str,
+                    "session_traffic_formatted": sess_traffic_str,
+                    "online_duration": dur_str,
+                    "session_duration_formatted": dur_str,
+                    "last_seen_text": last_seen_str,
+                    "last_active_human": last_seen_str
                 }
                 self.last_raw_stats[email] = {'up': cur_up, 'down': cur_down, 'time': now}
 
