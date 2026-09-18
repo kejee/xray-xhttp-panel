@@ -240,8 +240,10 @@ class StatsPlugin:
                 email, metric = parts[1], parts[3]
                 if email not in current_raw:
                     current_raw[email] = {'up': 0, 'down': 0}
-                if metric in ('uplink', 'downlink'):
-                    current_raw[email][metric[:4]] = int(item.get('value', 0))
+                if metric == 'uplink':
+                    current_raw[email]['up'] = int(item.get('value', 0))
+                elif metric == 'downlink':
+                    current_raw[email]['down'] = int(item.get('value', 0))
 
         total_spd_up = 0
         total_spd_down = 0
