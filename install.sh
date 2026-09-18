@@ -424,7 +424,8 @@ def dashboard():
         rows = [{'id': r[0], 'email': r[1]} for r in cur.fetchall()]
     server_ip = get_server_ip()
     cur_pub, cur_sid, _ = get_reality_info()
-    return render_template('dashboard.html', clients=rows, server_ip=server_ip, port=get_current_port(), pubkey=cur_pub, shortid=cur_sid, reality_domain=reality_domain, xhttp_domain=xhttp_domain, xhttp_path=xhttp_path, version=project_version)
+    pool_data = stats_plugin.get_stats().get('pool', {}) if stats_plugin else {'used_formatted': '0 B', 'limit_formatted': '无限制', 'limit_gb': 0, 'limit_bytes': 0}
+    return render_template('dashboard.html', clients=rows, server_ip=server_ip, port=get_current_port(), pubkey=cur_pub, shortid=cur_sid, reality_domain=reality_domain, xhttp_domain=xhttp_domain, xhttp_path=xhttp_path, version=project_version, pool=pool_data)
 
 @app.route('/sub/<id>')
 def client_subscription(id):
@@ -463,6 +464,21 @@ def api_reset_stats(uid):
         stats_plugin.reset_user_traffic(uid)
         return jsonify({"status": "ok"})
     return jsonify({"status": "disabled"})
+
+@app.route('/change_limit', methods=['POST'])
+@login_required
+def change_limit():
+    new_limit = request.form.get('limit_gb', type=float)
+    if new_limit is None or new_limit < 0:
+        flash("❌ 限额数值不合法！")
+        return redirect(url_for('dashboard'))
+    if stats_plugin:
+        stats_plugin.set_monthly_limit(new_limit)
+        if new_limit == 0:
+            flash("✅ 已设为无限流量模式，仅统计已用流量。")
+        else:
+            flash(f"✅ 月度共享流量限额已更新为 {new_limit:.2f} GB！")
+    return redirect(url_for('dashboard'))
 
 @app.route('/change_port', methods=['POST'])
 @login_required
@@ -892,6 +908,35 @@ cat > "$XRAY_PATH/web/templates/dashboard.html" <<'EOF'
       </form>
     </div>
 
+    <!-- 月度流量统计与限额设置 -->
+    <div class="mb-6 bg-white shadow rounded-lg p-4 border-l-4 border-violet-500">
+      <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-gray-500 font-medium">本月已用流量</span>
+            <span id="pool-limit-badge" class="text-xs px-2 py-0.5 rounded-full font-medium {% if pool and pool.limit_gb > 0 %}bg-blue-100 text-blue-700{% else %}bg-green-100 text-green-700{% endif %}">
+              {% if pool and pool.limit_gb > 0 %}限额 {{ pool.limit_formatted }} (剩 {{ pool.remaining_formatted }}){% else %}无限流量 (不设限){% endif %}
+            </span>
+          </div>
+          <p class="text-2xl font-bold font-mono text-gray-800 mt-1" id="pool-used">{{ pool.used_formatted if pool else '0 B' }}</p>
+        </div>
+        
+        <form method="post" action="/change_limit" class="flex items-center gap-2 flex-wrap">
+          <label class="text-gray-700 text-sm font-medium">月度限额 (GB)：</label>
+          <input type="number" name="limit_gb" step="1" min="0" value="{{ pool.limit_gb if pool else 0 }}" class="border px-2 py-1 rounded w-24 text-center text-sm focus:ring focus:border-violet-300 font-mono" placeholder="0为不限" />
+          <button type="submit" class="bg-violet-600 text-white px-3 py-1 rounded hover:bg-violet-700 shadow-sm transition text-sm">💾 保存限额</button>
+        </form>
+      </div>
+
+      <!-- 限额进度条 (若设置限额则显示，未设置隐藏) -->
+      <div id="pool-progress-container" class="mt-3 {% if not pool or pool.limit_gb <= 0 %}hidden{% endif %}">
+        <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+          <div id="pool-progress-bar" class="h-2 rounded-full transition-all duration-500 {% if pool and pool.status == 'danger' %}bg-red-500{% elif pool and pool.status == 'warning' %}bg-amber-500{% else %}bg-blue-500{% endif %}" style="width: {{ [pool.percent if pool else 0, 100]|min }}%;"></div>
+        </div>
+      </div>
+      <p class="text-xs text-gray-400 mt-2">💡 设为 <b>0</b> 时为无限流量，仅统计已用流量；输入具体数值（如 100）将开启超额预警与进度条。</p>
+    </div>
+
     <h2 class="text-2xl font-semibold mb-3">用户列表</h2>
     <ul class="space-y-4">
       {% for client in clients %}
@@ -977,6 +1022,33 @@ cat > "$XRAY_PATH/web/templates/dashboard.html" <<'EOF'
               ipBox.innerHTML = '<span class="text-gray-400 italic">暂无设备连入</span>';
             } else {
               ipBox.innerHTML = data.active_ips.map(ip => `<span class="bg-green-50 text-green-700 border border-green-200 px-2 py-0.5 rounded font-mono">${ip}</span>`).join('');
+            }
+          }
+
+          if (data.pool) {
+            const elPoolUsed = document.getElementById('pool-used');
+            const elBadge = document.getElementById('pool-limit-badge');
+            const elProgCont = document.getElementById('pool-progress-container');
+            const elProg = document.getElementById('pool-progress-bar');
+            
+            if (elPoolUsed) elPoolUsed.innerText = data.pool.used_formatted;
+            
+            if (data.pool.limit_gb > 0) {
+              if (elBadge) {
+                elBadge.className = 'text-xs px-2 py-0.5 rounded-full font-medium bg-blue-100 text-blue-700';
+                elBadge.innerText = `限额 ${data.pool.limit_formatted} (剩 ${data.pool.remaining_formatted})`;
+              }
+              if (elProgCont) elProgCont.classList.remove('hidden');
+              if (elProg) {
+                elProg.style.width = Math.min(100, data.pool.percent) + '%';
+                elProg.className = `h-2 rounded-full transition-all duration-500 ${data.pool.status === 'danger' ? 'bg-red-500' : (data.pool.status === 'warning' ? 'bg-amber-500' : 'bg-blue-500')}`;
+              }
+            } else {
+              if (elBadge) {
+                elBadge.className = 'text-xs px-2 py-0.5 rounded-full font-medium bg-green-100 text-green-700';
+                elBadge.innerText = '无限流量 (不设限)';
+              }
+              if (elProgCont) elProgCont.classList.add('hidden');
             }
           }
 

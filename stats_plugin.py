@@ -14,7 +14,7 @@ import datetime
 #      - 账号层：100% 依赖 Xray 原生 Stats API，按 UUID 独立记账，零误差
 #      - 物理层：100% 依赖 Linux 内核 Socket (ss -nt)，秒级反映真实物理连接
 #   2. 【月度共享流量池】：
-#      - 专为 Azure 每月 15GB 免费额度打造，自然月 (1号 00:00) 自动清零重置
+#      - 支持自定义月度流量配额（默认 0 不限额，仅展示已用量），自然月 (1号 00:00) 自动清零重置
 #      - 历史总流量永久归档存储，两者兼顾
 #   3. 【标准订阅协议 (Subscription-Userinfo)】：
 #      - 为小火箭 / Clash / v2rayN 等客户端注入标准用量响应头，界面直接显示进度条与到期时间
@@ -43,23 +43,41 @@ class StatsPlugin:
         self.total_speed_up = 0
         self.total_speed_down = 0
 
-        # 月度共享流量池指标
+        self._init_db()
+
+        # 月度共享流量池指标 (默认 0 表示无限制)
         self.pool_stats = {
             "used_bytes": 0,
             "limit_bytes": int(self.monthly_limit_gb * 1024 * 1024 * 1024),
+            "limit_gb": self.monthly_limit_gb,
             "used_formatted": "0 B",
             "limit_formatted": f"{self.monthly_limit_gb:.2f} GB" if self.monthly_limit_gb > 0 else "无限制",
-            "remaining_formatted": f"{self.monthly_limit_gb:.2f} GB" if self.monthly_limit_gb > 0 else "无限制",
+            "remaining_formatted": f"{self.monthly_limit_gb:.2f} GB" if self.monthly_limit_gb > 0 else "充足",
             "percent": 0.0,
             "status": "normal"  # normal / warning / danger
         }
 
-        self._init_db()
         self._start_collector()
 
     def _init_db(self):
         """初始化独立的流量持久化数据表 (支持月度周期与历史累计)"""
         with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            ''')
+            # 尝试从持久化配置中读取已保存的月度限额
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT value FROM settings WHERE key = 'monthly_limit_gb'")
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    self.monthly_limit_gb = max(0.0, float(row[0]))
+            except Exception:
+                pass
+
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS user_traffic (
                     uid TEXT PRIMARY KEY,
@@ -82,6 +100,7 @@ class StatsPlugin:
                     conn.execute(f'ALTER TABLE user_traffic ADD COLUMN {col} {col_type}')
                 except Exception:
                     pass
+            conn.commit()
             conn.commit()
 
     def _format_bytes(self, size_bytes):
@@ -311,6 +330,7 @@ class StatsPlugin:
                 "used_up_bytes": p_up,
                 "used_down_bytes": p_down,
                 "limit_bytes": limit_bytes,
+                "limit_gb": self.monthly_limit_gb,
                 "used_formatted": self._format_bytes(pool_used),
                 "limit_formatted": f"{self.monthly_limit_gb:.2f} GB" if self.monthly_limit_gb > 0 else "无限制",
                 "remaining_formatted": self._format_bytes(remaining_bytes) if limit_bytes > 0 else "充足",
@@ -391,3 +411,29 @@ class StatsPlugin:
             self.user_sessions[uid]['start_time'] = None
             self.user_sessions[uid]['last_active'] = 0
         return True
+
+    def set_monthly_limit(self, limit_gb):
+        """动态修改并持久化月度流量限制 (0 表示无限制，仅统计已用流量)"""
+        try:
+            val = max(0.0, float(limit_gb))
+        except (TypeError, ValueError):
+            val = 0.0
+        with self.lock:
+            self.monthly_limit_gb = val
+            limit_bytes = int(val * 1024 * 1024 * 1024)
+            self.pool_stats["limit_gb"] = val
+            self.pool_stats["limit_bytes"] = limit_bytes
+            self.pool_stats["limit_formatted"] = f"{val:.2f} GB" if val > 0 else "无限制"
+            if val > 0:
+                p_used = self.pool_stats.get("used_bytes", 0)
+                rem = max(0, limit_bytes - p_used)
+                self.pool_stats["remaining_formatted"] = self._format_bytes(rem)
+                self.pool_stats["percent"] = round((p_used / limit_bytes * 100), 1)
+            else:
+                self.pool_stats["remaining_formatted"] = "充足"
+                self.pool_stats["percent"] = 0.0
+                self.pool_stats["status"] = "normal"
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('monthly_limit_gb', ?)", (str(val),))
+            conn.commit()
+        return val
