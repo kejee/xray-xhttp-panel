@@ -214,7 +214,7 @@ cat > "$XRAY_CONFIG_DIR/config.json" <<EOF
   },
   "inbounds": [
     { 
-      "listen": "0.0.0.0",
+      "listen": "::",
       "port": $XRAY_PORT,
       "protocol": "vless",
       "settings": {
@@ -882,15 +882,40 @@ def get_current_port():
     except:
         return $XRAY_PORT
 
-def get_server_ip():
-    try:
-        ip = os.popen('curl -s --connect-timeout 2 http://checkip.amazonaws.com || curl -s --connect-timeout 2 https://ifconfig.me').read().strip()
-        if ip: return ip
-    except:
-        pass
-    if request and request.host:
-        return request.host.split(':')[0]
-    return "127.0.0.1"
+_ip_cache = {'ipv4': None, 'ipv6': None, 'time': 0}
+
+def get_server_ips():
+    """安全探测并缓存本机的公网 IPv4 与 IPv6 (超时短、带缓存，零任何域名与敏感信息)"""
+    global _ip_cache
+    now = time.time()
+    if (not _ip_cache['ipv4'] and not _ip_cache['ipv6']) or (now - _ip_cache['time'] > 120):
+        # 1. 探测 IPv4
+        try:
+            v4 = os.popen('curl -4 -s --connect-timeout 2 https://api.ipify.org || curl -4 -s --connect-timeout 2 http://checkip.amazonaws.com || curl -4 -s --connect-timeout 2 https://ifconfig.me').read().strip()
+            if re.match(r'^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$', v4):
+                _ip_cache['ipv4'] = v4
+        except Exception:
+            pass
+
+        # 2. 探测 IPv6
+        try:
+            v6 = os.popen('curl -6 -s --connect-timeout 2 https://api64.ipify.org || curl -6 -s --connect-timeout 2 https://icanhazip.com || curl -6 -s --connect-timeout 2 https://ifconfig.co').read().strip()
+            if ':' in v6 and len(v6) < 45:
+                _ip_cache['ipv6'] = v6
+        except Exception:
+            pass
+
+        _ip_cache['time'] = now
+
+    # 兜底 fallback：若均未探测到，尝试从 HTTP 请求头提取
+    if not _ip_cache['ipv4'] and not _ip_cache['ipv6']:
+        host_header = request.host.split(':')[0] if request and request.host else '127.0.0.1'
+        if ':' in host_header:
+            _ip_cache['ipv6'] = host_header.strip('[]')
+        else:
+            _ip_cache['ipv4'] = host_header
+
+    return _ip_cache['ipv4'], _ip_cache['ipv6']
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -913,25 +938,44 @@ def dashboard():
     with sqlite3.connect(db_path) as conn:
         cur = conn.execute('SELECT id, comment FROM clients')
         rows = [{'id': r[0], 'email': r[1]} for r in cur.fetchall()]
-    server_ip = get_server_ip()
+    ipv4, ipv6 = get_server_ips()
+    server_ip = ipv4 if ipv4 else (f"[{ipv6}]" if ipv6 else "127.0.0.1")
     cur_pub, cur_sid, _ = get_reality_info()
     pool_data = stats_plugin.get_stats().get('pool', {}) if stats_plugin else {'used_formatted': '0 B', 'limit_formatted': '无限制', 'limit_gb': 0, 'limit_bytes': 0}
-    return render_template('dashboard.html', clients=rows, server_ip=server_ip, port=get_current_port(), pubkey=cur_pub, shortid=cur_sid, reality_domain=reality_domain, xhttp_domain=xhttp_domain, xhttp_path=xhttp_path, version=project_version, pool=pool_data)
+    return render_template('dashboard.html', clients=rows, server_ip=server_ip, ipv4=ipv4, ipv6=ipv6, port=get_current_port(), pubkey=cur_pub, shortid=cur_sid, reality_domain=reality_domain, xhttp_domain=xhttp_domain, xhttp_path=xhttp_path, version=project_version, pool=pool_data)
 
 @app.route('/sub/<id>')
 def client_subscription(id):
-    """标准客户端订阅接口 (小火箭 / Clash / v2rayN 通用，注入 Subscription-Userinfo 响应头)"""
+    """标准客户端订阅接口 (小火箭 / Clash / v2rayN 通用，下发纯 IP 直连节点)"""
     with sqlite3.connect(db_path) as conn:
         row = conn.execute('SELECT comment FROM clients WHERE id = ?', (id,)).fetchone()
         if not row:
             return Response("User Not Found", status=404)
         email = row[0]
     
-    server_ip = get_server_ip()
+    ipv4, ipv6 = get_server_ips()
     cur_pub, cur_sid, _ = get_reality_info()
-    link = f"vless://{id}@{server_ip}:{get_current_port()}?encryption=none&security=reality&type=xhttp&host={xhttp_domain}&path={xhttp_path}&pbk={cur_pub}&sid={cur_sid}&sni={reality_domain}&fp=chrome#{quote(email)}"
+    port = get_current_port()
+
+    links = []
+    # 纯 IPv6 直连节点 (若机器具备公网 IPv6)
+    if ipv6:
+        tag = f"{email} - IPv6" if ipv4 else email
+        links.append(f"vless://{id}@[{ipv6}]:{port}?encryption=none&security=reality&type=xhttp&host={xhttp_domain}&path={xhttp_path}&pbk={cur_pub}&sid={cur_sid}&sni={reality_domain}&fp=chrome#{quote(tag)}")
+
+    # 纯 IPv4 直连节点 (若机器具备公网 IPv4)
+    if ipv4:
+        tag = f"{email} - IPv4" if ipv6 else email
+        links.append(f"vless://{id}@{ipv4}:{port}?encryption=none&security=reality&type=xhttp&host={xhttp_domain}&path={xhttp_path}&pbk={cur_pub}&sid={cur_sid}&sni={reality_domain}&fp=chrome#{quote(tag)}")
+
+    # 兜底：若均无法探测，使用默认 server_ip
+    if not links:
+        server_ip = request.host.split(':')[0] if request and request.host else '127.0.0.1'
+        ep = f"[{server_ip}]" if ':' in server_ip else server_ip
+        links.append(f"vless://{id}@{ep}:{port}?encryption=none&security=reality&type=xhttp&host={xhttp_domain}&path={xhttp_path}&pbk={cur_pub}&sid={cur_sid}&sni={reality_domain}&fp=chrome#{quote(email)}")
+
     import base64
-    content = base64.b64encode(link.encode('utf-8')).decode('utf-8')
+    content = base64.b64encode('\n'.join(links).encode('utf-8')).decode('utf-8')
     resp = Response(content, mimetype='text/plain; charset=utf-8')
     
     if stats_plugin:
@@ -1013,7 +1057,8 @@ def qrcode_img(id):
     with sqlite3.connect(db_path) as conn:
         row = conn.execute('SELECT comment FROM clients WHERE id = ?', (id,)).fetchone()
         email = row[0] if row else 'user'
-    server_ip = get_server_ip()
+    ipv4, ipv6 = get_server_ips()
+    server_ip = ipv4 if ipv4 else (f"[{ipv6}]" if ipv6 else "127.0.0.1")
     cur_pub, cur_sid, _ = get_reality_info()
     link = f"vless://{id}@{server_ip}:{get_current_port()}?encryption=none&security=reality&type=xhttp&host={xhttp_domain}&path={xhttp_path}&pbk={cur_pub}&sid={cur_sid}&sni={reality_domain}&fp=chrome#{quote(email)}"
     img = qrcode.make(link)
@@ -1227,7 +1272,7 @@ def update_config():
     os.system('systemctl restart xray')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=$PANEL_PORT)
+    app.run(host='::', port=$PANEL_PORT)
 EOF
 
 DB_FILE="$XRAY_PATH/web/clients.db"
@@ -1323,6 +1368,11 @@ cat > "$XRAY_PATH/web/templates/dashboard.html" <<'EOF'
     function copyLink(uuid) {
       const input = document.getElementById('link-' + uuid);
       copyText(input.value, "✅ 已复制 VLESS 节点链接！");
+    }
+    function copyIpLink(uuid, ip, tag) {
+      const input = document.getElementById('link-' + uuid);
+      const replaced = input.value.replace(/@[^:]+:/, '@' + ip + ':');
+      copyText(replaced, `✅ 已复制 ${tag} 节点链接！`);
     }
     function copySub(uuid) {
       const subUrl = window.location.origin + '/sub/' + uuid;
@@ -1459,7 +1509,14 @@ cat > "$XRAY_PATH/web/templates/dashboard.html" <<'EOF'
           <input id="link-{{ client.id }}" type="text"
             class="w-full border px-2 py-1 rounded text-xs font-mono text-gray-700 bg-gray-50 focus:outline-none"
             value="vless://{{ client.id }}@{{ server_ip }}:{{ port }}?encryption=none&security=reality&type=xhttp&host={{ xhttp_domain }}&path={{ xhttp_path }}&pbk={{ pubkey }}&sid={{ shortid }}&sni={{ reality_domain }}&fp=chrome#{{ client.email | urlencode }}" readonly />
-          <button onclick="copyLink('{{ client.id }}')" class="mt-2 px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600 shadow-sm transition">📋 复制节点链接</button>
+          <div class="mt-2 flex gap-2 flex-wrap items-center">
+            {% if ipv4 and ipv6 %}
+            <button onclick="copyIpLink('{{ client.id }}', '{{ ipv4 }}', 'IPv4')" class="px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600 shadow-sm transition">📋 单节点 (IPv4)</button>
+            <button onclick="copyIpLink('{{ client.id }}', '[{{ ipv6 }}]', 'IPv6')" class="px-3 py-1 bg-teal-600 text-white text-xs rounded hover:bg-teal-700 shadow-sm transition">📋 单节点 (IPv6)</button>
+            {% else %}
+            <button onclick="copyLink('{{ client.id }}')" class="px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600 shadow-sm transition">📋 复制节点链接</button>
+            {% endif %}
+          </div>
         </div>
       </li>
       {% endfor %}
@@ -1620,13 +1677,23 @@ if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
   sysctl -p >/dev/null 2>&1
 fi
 
-SERVER_IP=$(curl -s http://checkip.amazonaws.com)
+SERVER_IPV4=$(curl -4 -s --connect-timeout 2 https://api.ipify.org || curl -4 -s --connect-timeout 2 http://checkip.amazonaws.com || echo "")
+SERVER_IPV6=$(curl -6 -s --connect-timeout 2 https://api64.ipify.org || curl -6 -s --connect-timeout 2 https://icanhazip.com || echo "")
+MAIN_IP="${SERVER_IPV4:-${SERVER_IPV6:-127.0.0.1}}"
 
 echo "=========================================="
 echo "✅ 开源安全版一键部署完成！"
 echo "------------------------------------------"
 echo "📌 项目版本：v$VERSION"
-echo "🔗 访问管理面板：http://$SERVER_IP:$PANEL_PORT"
+if [ -n "$SERVER_IPV4" ]; then
+echo "🔗 面板访问地址 (IPv4)：http://$SERVER_IPV4:$PANEL_PORT"
+fi
+if [ -n "$SERVER_IPV6" ]; then
+echo "🔗 面板访问地址 (IPv6)：http://[$SERVER_IPV6]:$PANEL_PORT"
+fi
+if [ -z "$SERVER_IPV4" ] && [ -z "$SERVER_IPV6" ]; then
+echo "🔗 访问管理面板：http://$MAIN_IP:$PANEL_PORT"
+fi
 echo "👤 登录账号：$USER_NAME"
 echo "🔑 动态登录密码：$USER_PASSWORD"
 echo "------------------------------------------"
