@@ -810,6 +810,8 @@ import os
 import json
 import sqlite3
 import qrcode
+import time
+import re
 from urllib.parse import quote
 
 app = Flask(__name__)
@@ -916,6 +918,10 @@ def get_server_ips():
             _ip_cache['ipv4'] = host_header
 
     return _ip_cache['ipv4'], _ip_cache['ipv6']
+
+def get_server_ip():
+    ipv4, ipv6 = get_server_ips()
+    return ipv4 if ipv4 else (f"[{ipv6}]" if ipv6 else "127.0.0.1")
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
