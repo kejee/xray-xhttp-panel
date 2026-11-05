@@ -283,6 +283,8 @@ After=network.target
 ExecStart=$XRAY_BIN run -config $XRAY_CONFIG_DIR/config.json
 Restart=on-failure
 User=$XRAY_USER
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -812,6 +814,7 @@ import sqlite3
 import qrcode
 import time
 import re
+import threading
 from urllib.parse import quote
 
 app = Flask(__name__)
@@ -884,16 +887,14 @@ def get_current_port():
     except:
         return $XRAY_PORT
 
-_ip_cache = {'ipv4': None, 'ipv6': None, 'time': 0}
+_ip_cache = {'ipv4': None, 'ipv6': None, 'time': 0, 'detecting': False}
 
-def get_server_ips():
-    """安全探测并缓存本机的公网 IPv4 与 IPv6 (超时短、带缓存，零任何域名与敏感信息)"""
+def _detect_ips_worker():
     global _ip_cache
-    now = time.time()
-    if (not _ip_cache['ipv4'] and not _ip_cache['ipv6']) or (now - _ip_cache['time'] > 120):
+    try:
         # 1. 探测 IPv4
         try:
-            v4 = os.popen('curl -4 -s --connect-timeout 2 https://api.ipify.org || curl -4 -s --connect-timeout 2 http://checkip.amazonaws.com || curl -4 -s --connect-timeout 2 https://ifconfig.me').read().strip()
+            v4 = os.popen('curl -4 -s --connect-timeout 2 https://api.ipify.org || curl -4 -s --connect-timeout 2 http://checkip.amazonaws.com').read().strip()
             if re.match(r'^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$', v4):
                 _ip_cache['ipv4'] = v4
         except Exception:
@@ -901,23 +902,41 @@ def get_server_ips():
 
         # 2. 探测 IPv6
         try:
-            v6 = os.popen('curl -6 -s --connect-timeout 2 https://api64.ipify.org || curl -6 -s --connect-timeout 2 https://icanhazip.com || curl -6 -s --connect-timeout 2 https://ifconfig.co').read().strip()
+            v6 = os.popen('curl -6 -s --connect-timeout 2 https://api64.ipify.org || curl -6 -s --connect-timeout 2 https://icanhazip.com').read().strip()
             if ':' in v6 and len(v6) < 45:
                 _ip_cache['ipv6'] = v6
         except Exception:
             pass
 
-        _ip_cache['time'] = now
+        _ip_cache['time'] = time.time()
+    finally:
+        _ip_cache['detecting'] = False
+
+def get_server_ips():
+    """安全探测并缓存本机的公网 IPv4 与 IPv6 (异步后台刷新，绝不阻塞 Web 请求)"""
+    global _ip_cache
+    now = time.time()
+    
+    # 若缓存未建立，首次同步快速探测；若已建立但过期(>300s)，后台异步刷新
+    if not _ip_cache['ipv4'] and not _ip_cache['ipv6']:
+        if not _ip_cache['detecting']:
+            _ip_cache['detecting'] = True
+            _detect_ips_worker()
+    elif now - _ip_cache['time'] > 300 and not _ip_cache['detecting']:
+        _ip_cache['detecting'] = True
+        threading.Thread(target=_detect_ips_worker, daemon=True).start()
 
     # 兜底 fallback：若均未探测到，尝试从 HTTP 请求头提取
-    if not _ip_cache['ipv4'] and not _ip_cache['ipv6']:
+    v4 = _ip_cache['ipv4']
+    v6 = _ip_cache['ipv6']
+    if not v4 and not v6:
         host_header = request.host.split(':')[0] if request and request.host else '127.0.0.1'
         if ':' in host_header:
-            _ip_cache['ipv6'] = host_header.strip('[]')
+            v6 = host_header.strip('[]')
         else:
-            _ip_cache['ipv4'] = host_header
+            v4 = host_header
 
-    return _ip_cache['ipv4'], _ip_cache['ipv6']
+    return v4, v6
 
 def get_server_ip():
     ipv4, ipv6 = get_server_ips()
@@ -1025,18 +1044,37 @@ def change_limit():
 @login_required
 def change_port():
     new_port = request.form.get('port', type=int)
+    is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.is_json
     if not new_port or new_port < 1 or new_port > 65535:
+        if is_ajax:
+            return jsonify({"status": "error", "message": "❌ 端口号必须在 1 到 65535 之间！"}), 400
         flash("❌ 端口号必须在 1 到 65535 之间！")
         return redirect(url_for('dashboard'))
     try:
         with open(xray_config, 'r') as f: config = json.load(f)
+        old_port = config['inbounds'][0].get('port')
         config['inbounds'][0]['port'] = new_port
-        os.system('chown www-data:www-data ' + xray_config)
         with open(xray_config, 'w') as f: json.dump(config, f, indent=2)
-        os.system('systemctl restart xray')
-        flash(f"✅ Xray 节点端口已成功修改为 {new_port}！请务必在服务器防火墙中放行该新端口。")
+        os.system('chown www-data:www-data ' + xray_config)
+        ret = os.system('systemctl restart xray')
+        if ret != 0:
+            # 重启失败，尝试自动回滚
+            if old_port:
+                config['inbounds'][0]['port'] = old_port
+                with open(xray_config, 'w') as f: json.dump(config, f, indent=2)
+                os.system('chown www-data:www-data ' + xray_config)
+                os.system('systemctl restart xray')
+            raise Exception("Xray 核心重启失败，已自动回滚原端口！请检查新端口是否被占用或配置是否正确。")
+
+        msg = f"✅ Xray 节点端口已成功修改为 {new_port}！请务必在服务器防火墙中放行该新端口。"
+        if is_ajax:
+            return jsonify({"status": "ok", "message": msg, "new_port": new_port})
+        flash(msg)
     except Exception as e:
-        flash(f"❌ 修改端口失败: {str(e)}")
+        err_msg = f"❌ 修改端口失败: {str(e)}"
+        if is_ajax:
+            return jsonify({"status": "error", "message": err_msg}), 500
+        flash(err_msg)
     return redirect(url_for('dashboard'))
 
 @app.route('/add', methods=['POST'])
@@ -1384,6 +1422,39 @@ cat > "$XRAY_PATH/web/templates/dashboard.html" <<'EOF'
       const subUrl = window.location.origin + '/sub/' + uuid;
       copyText(subUrl, "✅ 已复制通用订阅链接！可直接导入小火箭 / Clash / v2rayN");
     }
+    async function handlePortChange(e) {
+      e.preventDefault();
+      const input = document.getElementById('nodePortInput');
+      const btn = document.getElementById('nodePortBtn');
+      const newPort = input.value;
+      if (!newPort || newPort < 1 || newPort > 65535) {
+        alert("❌ 端口必须在 1 到 65535 之间！");
+        return;
+      }
+      btn.disabled = true;
+      btn.innerText = "修改中...";
+      try {
+        const res = await fetch('/change_port', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+          body: 'port=' + encodeURIComponent(newPort)
+        });
+        const data = await res.json();
+        if (res.ok && data.status === 'ok') {
+          alert(data.message + "\n\n⚠️ 重要提醒：\n若你正通过此节点代理上网，旧端口连接已中断。\n请立即在客户端将节点端口更新为 " + newPort + "！");
+          document.querySelectorAll('input[id^="link-"]').forEach(inp => {
+            inp.value = inp.value.replace(/:[0-9]+(\?encryption=)/, ':' + newPort + '$1');
+          });
+        } else {
+          alert(data.message || '修改端口失败');
+        }
+      } catch (err) {
+        alert("⚠️ 修改请求已发送，但由于 Xray 节点端口变更，若你正在使用本代理上网，网络连接可能已中断。\n请前往客户端将节点端口更新为 " + newPort + " 即可恢复！");
+      } finally {
+        btn.disabled = false;
+        btn.innerText = "💾 修改端口";
+      }
+    }
     async function resetTraffic(uid, name) {
       if (!confirm(`确定要重置用户【${name}】的流量统计吗？`)) return;
       try {
@@ -1448,10 +1519,10 @@ cat > "$XRAY_PATH/web/templates/dashboard.html" <<'EOF'
 
     <div class="mb-6 bg-white shadow rounded-lg p-4 flex flex-col md:flex-row gap-4 items-center justify-between border-l-4 border-blue-500">
       <div><p class="text-base">服务器 IP：<span class="font-mono text-green-700 font-semibold">{{ server_ip }}</span></p></div>
-      <form method="post" action="/change_port" class="flex items-center gap-2">
+      <form id="portForm" onsubmit="handlePortChange(event)" class="flex items-center gap-2">
         <label class="text-gray-700 text-sm font-medium">节点端口：</label>
-        <input type="number" name="port" value="{{ port }}" min="1" max="65535" required class="border px-2 py-1 rounded w-24 text-center focus:ring focus:border-blue-300 text-sm" />
-        <button type="submit" class="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600 shadow-sm transition text-sm">💾 修改端口</button>
+        <input type="number" id="nodePortInput" name="port" value="{{ port }}" min="1" max="65535" required class="border px-2 py-1 rounded w-24 text-center focus:ring focus:border-blue-300 text-sm" />
+        <button type="submit" id="nodePortBtn" class="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600 shadow-sm transition text-sm">💾 修改端口</button>
       </form>
     </div>
 
