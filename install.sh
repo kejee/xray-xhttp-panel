@@ -814,12 +814,34 @@ import sqlite3
 import qrcode
 import time
 import re
+import random
 import threading
 from urllib.parse import quote
 
 app = Flask(__name__)
 app.secret_key = '$FLASK_SECRET'
 app.jinja_env.filters['urlencode'] = quote
+
+# 登录安全防爆破数据结构 (IP 频次限制 + 错误惩罚 + 算术验证码)
+_login_attempts = {}
+_login_lock = threading.Lock()
+
+def _get_client_ip():
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    if request.headers.get('X-Real-IP'):
+        return request.headers.get('X-Real-IP').strip()
+    return request.remote_addr or '127.0.0.1'
+
+def _generate_captcha():
+    n1 = random.randint(1, 20)
+    n2 = random.randint(1, 20)
+    op = random.choice(['+', '-'])
+    if op == '-' and n1 < n2:
+        n1, n2 = n2, n1
+    ans = n1 + n2 if op == '+' else n1 - n2
+    q = f"{n1} {op} {n2} = ?"
+    return q, str(ans)
 
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
@@ -944,12 +966,67 @@ def get_server_ip():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    now = time.time()
+    ip = _get_client_ip()
+
+    with _login_lock:
+        rec = _login_attempts.setdefault(ip, {'count': 0, 'last_time': now, 'lock_until': 0})
+        # 1. 检查是否处于 IP 封禁期 (连续输错 5 次锁 15 分钟)
+        if rec['lock_until'] > now:
+            rem_min = int((rec['lock_until'] - now) // 60) + 1
+            flash(f"❌ 连续登录失败次数过多，该 IP 已被锁定，请 {rem_min} 分钟后再试！")
+            return render_template('login.html', version=project_version, require_captcha=True, captcha_q="IP已被锁定")
+
+        # 超过 15 分钟无新尝试，自动重置旧错误计数
+        if now - rec['last_time'] > 900:
+            rec['count'] = 0
+
     if request.method == 'POST':
-        if request.form['username'] == "$USER_NAME" and request.form['password'] == "$USER_PASSWORD":
+        # 2. 输错达到 3 次，强制校验算术验证码
+        if rec['count'] >= 3:
+            user_captcha = request.form.get('captcha', '').strip()
+            real_captcha = session.get('captcha_ans')
+            if not user_captcha or user_captcha != real_captcha:
+                time.sleep(1.0)
+                flash("❌ 验证码计算错误，请重新输入！")
+                q, a = _generate_captcha()
+                session['captcha_ans'] = a
+                session['captcha_q'] = q
+                return render_template('login.html', version=project_version, require_captcha=True, captcha_q=q)
+
+        username = request.form.get('username')
+        password = request.form.get('password')
+
+        if username == "$USER_NAME" and password == "$USER_PASSWORD":
+            with _login_lock:
+                rec['count'] = 0
+                rec['lock_until'] = 0
+            session.pop('captcha_ans', None)
+            session.pop('captcha_q', None)
             login_user(User("$USER_NAME"))
             return redirect(url_for('dashboard'))
-        flash("用户名或密码错误")
-    return render_template('login.html', version=project_version)
+
+        # 密码错误惩罚 (延迟 1 秒防高速并发爆破)
+        time.sleep(1.0)
+        with _login_lock:
+            rec['count'] += 1
+            rec['last_time'] = now
+            if rec['count'] >= 5:
+                rec['lock_until'] = now + 900
+                flash("❌ 连续密码错误达 5 次，该 IP 已被安全锁定 15 分钟！")
+            else:
+                rem_tries = 5 - rec['count']
+                flash(f"❌ 用户名或密码错误！剩余尝试机会：{rem_tries} 次")
+
+    need_captcha = rec['count'] >= 3
+    captcha_q = ""
+    if need_captcha:
+        q, a = _generate_captcha()
+        session['captcha_ans'] = a
+        session['captcha_q'] = q
+        captcha_q = q
+
+    return render_template('login.html', version=project_version, require_captcha=need_captcha, captcha_q=captcha_q)
 
 @app.route('/logout')
 @login_required
@@ -1371,13 +1448,22 @@ cat > "$XRAY_PATH/web/templates/login.html" <<'EOF'
     <form method="post" class="space-y-4">
       <div>
         <label class="block text-sm font-medium text-gray-700">用户名</label>
-        <input type="text" name="username" required class="w-full px-3 py-2 border rounded shadow-sm">
+        <input type="text" name="username" required class="w-full px-3 py-2 border rounded shadow-sm focus:ring focus:border-blue-400">
       </div>
       <div>
         <label class="block text-sm font-medium text-gray-700">密码</label>
-        <input type="password" name="password" required class="w-full px-3 py-2 border rounded shadow-sm">
+        <input type="password" name="password" required class="w-full px-3 py-2 border rounded shadow-sm focus:ring focus:border-blue-400">
       </div>
-      <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700">登录</button>
+      {% if require_captcha %}
+      <div class="bg-indigo-50 border border-indigo-200 p-3 rounded">
+        <label class="block text-xs font-semibold text-indigo-800 mb-1">人机安全验证 (输错3次激活)</label>
+        <div class="flex items-center gap-2">
+          <span class="font-mono font-bold text-base bg-white px-3 py-1.5 border rounded border-indigo-300 text-indigo-700 tracking-wider">{{ captcha_q }}</span>
+          <input type="text" name="captcha" required placeholder="计算结果" class="w-full px-3 py-2 border rounded shadow-sm focus:ring focus:border-indigo-400 text-sm">
+        </div>
+      </div>
+      {% endif %}
+      <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700 font-medium shadow-sm transition">登录</button>
     </form>
   </div>
   <p class="text-xs text-gray-400 mt-4">Xray-XHTTP-Panel v{{ version }}</p>
